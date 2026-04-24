@@ -747,3 +747,125 @@ app.patch("/api/complaints/admin-flag/:id", async (req, res) => {
     res.status(500).send({ success: false, error: error.message });
   }
 });
+// --- MARK AS FAKE (Admin Action) ---
+app.patch("/api/complaints/mark-fake/:id", async (req, res) => {
+  const { id } = req.params;
+  const { reporterEmail } = req.body;
+
+  try {
+    const complaint = await complaintsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (complaint.status === "Fake") {
+      return res.send({ success: false, message: "Already marked as fake" });
+    }
+
+    await complaintsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { status: "Fake", priority: "Low" } },
+    );
+
+    const user = await usersCollection.findOne({ email: reporterEmail });
+    if (user) {
+      const newScore = Math.max(0, (user.trustScore || 0) - 50);
+      await usersCollection.updateOne(
+        { email: reporterEmail },
+        { $set: { trustScore: newScore } },
+      );
+    }
+
+    res.send({ success: true });
+  } catch (error) {
+    res.status(500).send({ success: false, message: error.message });
+  }
+});
+
+// --- 6. STRICT UPDATE STATUS & RESTORE PENALTY ---
+app.patch("/api/complaints/status/:id", async (req, res) => {
+  const { id } = req.params;
+  const { status: newStatus, reporterEmail, adminEmail } = req.body;
+
+  if (!ADMIN_EMAILS.includes(adminEmail)) {
+    return res.status(403).send({ message: "Unauthorized" });
+  }
+
+  try {
+    const oldComplaint = await complaintsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+
+    if (!oldComplaint) {
+      return res
+        .status(404)
+        .send({ success: false, message: "Complaint not found" });
+    }
+
+    // Server-Side Strict Workflow Validation [cite: 32, 33]
+    const LIFECYCLE = [
+      "Open",
+      "In Review",
+      "Work in Progress",
+      "Resolved",
+      "Closed",
+    ];
+
+    let currentStatus =
+      oldComplaint.status === "pending"
+        ? "Open"
+        : oldComplaint.status || "Open";
+
+    if (newStatus !== "Fake" && currentStatus !== "Fake") {
+      const currentIndex = LIFECYCLE.indexOf(currentStatus);
+      const newIndex = LIFECYCLE.indexOf(newStatus);
+
+      if (newIndex !== currentIndex + 1 && newIndex !== currentIndex) {
+        return res.status(400).send({
+          success: false,
+          message:
+            "Invalid status transition. You must follow the exact lifecycle sequence.",
+        });
+      }
+    }
+
+    // --- TIMELINE LOGIC START ---
+    // Use "Reported" for UI clarity if the status is "Open"
+    const displayStatus = newStatus === "Open" ? "Reported" : newStatus;
+
+    const timelineEntry = {
+      status: displayStatus,
+      time: new Date(), // Captured at the moment of update
+      message: `Status updated by admin (${adminEmail})`,
+    };
+    // --- TIMELINE LOGIC END ---
+
+    // RESTORE LOGIC: If moving AWAY from Fake, restore Trust Score [cite: 24, 40]
+    if (currentStatus === "Fake" && newStatus !== "Fake") {
+      const user = await usersCollection.findOne({ email: reporterEmail });
+      if (user) {
+        const restoredScore = Math.min(100, (user.trustScore || 0) + 50);
+        await usersCollection.updateOne(
+          { email: reporterEmail },
+          { $set: { trustScore: restoredScore } },
+        );
+      }
+    }
+
+    // Update the complaint status AND push to the timeline array [cite: 31, 49]
+    const result = await complaintsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $set: { status: newStatus },
+        $push: { timeline: timelineEntry },
+      },
+    );
+
+    res.send({
+      success: true,
+      message: `Status updated to ${newStatus}. Timeline entry created.`,
+      result,
+    });
+  } catch (error) {
+    res.status(500).send({ success: false, message: error.message });
+  }
+});
