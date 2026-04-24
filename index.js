@@ -1,0 +1,597 @@
+const express = require("express");
+const cors = require("cors");
+require("dotenv").config();
+const SSLCommerzPayment = require("sslcommerz-lts");
+const { MongoClient, ServerApiVersion, ObjectId } = require("mongodb");
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(
+  cors({
+    origin: [
+      "http://localhost:5173",
+      "https://project-civiceye.netlify.app/", // Add this AFTER you get your Netlify link
+    ],
+    credentials: true,
+  }),
+);
+
+const port = process.env.PORT || 1069;
+
+const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASSWORD}@cluster0.tfpkery.mongodb.net/?appName=Cluster0`;
+
+const client = new MongoClient(uri, {
+  serverApi: {
+    version: ServerApiVersion.v1,
+    strict: true,
+    deprecationErrors: true,
+  },
+});
+
+let complaintsCollection;
+let usersCollection;
+let ordersCollection;
+let workersCollection;
+let postsCollection;
+let notificationsCollection;
+
+const store_id = process.env.STORE_ID;
+const store_passwd = process.env.STORE_PASSWORD;
+const is_live = false;
+// const puppeteer = require("puppeteer");
+const chromium = require("@sparticuz/chromium-min");
+const puppeteer = require("puppeteer-core");
+const HF_TOKEN = process.env.HF_Key;
+
+let isConnected = false;
+
+async function connectDB() {
+  if (!isConnected) {
+    await client.connect();
+
+    const database = client.db("civicEyeDB");
+
+    complaintsCollection = database.collection("complaints");
+    usersCollection = database.collection("users");
+    ordersCollection = database.collection("orders");
+    workersCollection = database.collection("workers");
+    postsCollection = database.collection("posts");
+    notificationsCollection = database.collection("notifications");
+
+    isConnected = true;
+    //console.log("✅ MongoDB connected");
+  }
+}
+// await run();
+// run().catch(console.dir);
+
+const calculateUrgency = (prob) => {
+  const now = new Date();
+  const cat = (prob.category || "").toLowerCase();
+  const desc = (prob.description || "").toLowerCase();
+
+  let keywordWeight = 10;
+  // Use the specific weights defined in your Module 2 requirements
+  if (cat === "fire hazard") keywordWeight = 40;
+  else if (cat === "electrical") keywordWeight = 35;
+  else if (cat === "water leak" || cat === "water") keywordWeight = 25;
+  else if (cat.includes("garbage") || cat === "environment") keywordWeight = 15;
+  else if (cat === "road" || cat.includes("pothole")) keywordWeight = 15;
+  else {
+    // Fallback to keyword description check
+    if (desc.includes("fire") || desc.includes("smoke")) keywordWeight = 40;
+    else if (desc.includes("electric") || desc.includes("spark"))
+      keywordWeight = 35;
+    else if (desc.includes("flood") || desc.includes("leak"))
+      keywordWeight = 25;
+    else if (desc.includes("trash") || desc.includes("waste"))
+      keywordWeight = 15;
+  }
+
+  const upvotes = prob.upvotes || 0;
+  const createdAtDate = prob.createdAt ? new Date(prob.createdAt) : now;
+  const hoursSincePosted = Math.max(
+    0,
+    (now - createdAtDate) / (1000 * 60 * 60),
+  );
+  const cappedHours = Math.min(hoursSincePosted, 48);
+
+  // Requirement: (Keyword_Weight * 2) + (Upvote_Count * 1.5) + (Hours_Since_Posted * 0.5)
+  const rawScore = keywordWeight * 2 + upvotes * 1.5 + cappedHours * 0.5;
+  return Math.min(100, Math.max(1, Math.round(rawScore)));
+};
+
+// --- API ENDPOINTS ---
+
+app.get("/", (req, res) => {
+  res.send("CivicEye Server is Running");
+});
+
+// 1. Get User Profile & Trust Score
+app.get("/api/users/:email", async (req, res) => {
+  try {
+    await connectDB();
+    const email = req.params.email;
+    let user = await usersCollection.findOne({ email });
+
+    if (!user) {
+      const newUser = {
+        email,
+        trustScore: 100,
+        name: "New Citizen",
+        createdAt: new Date(),
+      };
+      await usersCollection.insertOne(newUser);
+      user = newUser;
+    }
+    res.send(user);
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// 1. Submit Complaint Endpoint (Zobaer's Module: Duplicate Detection & Auto-Categorization) [cite: 26, 67]
+app.post("/api/complaints", async (req, res) => {
+  try {
+    const complaintData = req.body;
+    const { userEmail, location, address, category } = complaintData;
+
+    // Standardize input: Map Report uses 'description', Smart Form uses 'additionalNotes' [cite: 18, 22]
+    const userNotes =
+      complaintData.description || complaintData.additionalNotes || "";
+    const desc = userNotes.toLowerCase();
+
+    if (!userEmail) {
+      return res
+        .status(400)
+        .send({ success: false, error: "User Email is required" });
+    }
+
+    // --- TRUST SCORE CHECK (Shah Ahafik Arman's Module) [cite: 23, 25] ---
+    const dbUser = await usersCollection.findOne({ email: userEmail });
+    if (dbUser && dbUser.trustScore < 30) {
+      return res.status(403).send({
+        success: false,
+        error:
+          "Access Denied: Your Trust Score is below 30. You are restricted from submitting new reports.",
+      });
+    }
+
+    // --- AUTO-CATEGORIZATION & URGENCY WEIGHT (Zobaer Mahmud Zisan's Module) [cite: 20, 42, 67, 68] ---
+    let finalCategory = category || "General";
+    let keywordWeight = 10; // Default weight
+
+    // Logic to determine category and urgency weight from keywords
+    if (
+      finalCategory.toLowerCase() === "general" ||
+      finalCategory === "General"
+    ) {
+      if (
+        desc.includes("fire") ||
+        desc.includes("smoke") ||
+        desc.includes("burn")
+      ) {
+        finalCategory = "Fire Hazard";
+        keywordWeight = 40;
+      } else if (
+        desc.includes("electric") ||
+        desc.includes("wire") ||
+        desc.includes("spark")
+      ) {
+        finalCategory = "Electrical";
+        keywordWeight = 35;
+      } else if (
+        desc.includes("flood") ||
+        desc.includes("water") ||
+        desc.includes("leak") ||
+        desc.includes("pipe")
+      ) {
+        finalCategory = "Water Leak";
+        keywordWeight = 25;
+      } else if (
+        desc.includes("garbage") ||
+        desc.includes("trash") ||
+        desc.includes("waste")
+      ) {
+        finalCategory = "Environment";
+        keywordWeight = 15;
+      } else if (
+        desc.includes("pothole") ||
+        desc.includes("road") ||
+        desc.includes("broken")
+      ) {
+        finalCategory = "Road/Infrastructure";
+        keywordWeight = 15;
+      }
+    } else {
+      // Assign weight even if category was manually selected
+      const cat = finalCategory.toLowerCase();
+      if (cat.includes("fire") || cat.includes("electrical"))
+        keywordWeight = 40;
+      else if (cat.includes("water") || cat.includes("leak"))
+        keywordWeight = 25;
+      else if (cat.includes("environment") || cat.includes("road"))
+        keywordWeight = 15;
+    }
+
+    // --- SEVERITY CALCULATION (Initial)  ---
+    // At creation: Upvotes = 0, Hours_Since_Posted = 0
+    // Formula: (Keyword_Weight * 2) + (Upvotes * 1.5) + (Hours * 0.5)
+    let initialUrgencyScore = Math.min(
+      100,
+      Math.max(1, Math.round(keywordWeight * 2)),
+    );
+
+    // --- GEOSPATIAL DUPLICATE CHECK (Zobaer Mahmud Zisan's Module) [cite: 26, 28] ---
+    let duplicate = null;
+    if (location && location.lat) {
+      duplicate = await complaintsCollection.findOne({
+        category: finalCategory,
+        "location.lat": {
+          $gte: location.lat - 0.0001,
+          $lte: location.lat + 0.0001,
+        },
+        "location.lng": {
+          $gte: location.lng - 0.0001,
+          $lte: location.lng + 0.0001,
+        },
+        status: { $nin: ["Resolved", "Closed"] },
+      });
+    } else if (address) {
+      const addressKey = address.split(",")[0].trim();
+      duplicate = await complaintsCollection.findOne({
+        category: finalCategory,
+        address: { $regex: addressKey, $options: "i" },
+        status: { $nin: ["Resolved", "Closed"] },
+      });
+    }
+
+    if (duplicate) {
+      return res.status(409).send({
+        success: false,
+        isDuplicate: true,
+        message:
+          "This issue has already been reported here. Check the list to upvote it!",
+        existingId: duplicate._id,
+      });
+    }
+
+    // --- DATABASE INSERTION ---
+    const result = await complaintsCollection.insertOne({
+      ...complaintData,
+      description: userNotes,
+      category: finalCategory,
+      status: "Open", // Default starting state [cite: 32]
+      urgencyScore: initialUrgencyScore, // Pre-calculated severity
+      beforeImage: complaintData.beforeImage || null,
+      afterImage: null,
+      upvotes: 0,
+      flags: 0,
+      priority: initialUrgencyScore > 50 ? "High" : "Medium",
+      timeline: [
+        {
+          status: "Reported",
+          time: new Date(),
+          message: "Issue reported by citizen and logged into the system.",
+        },
+      ],
+      upvotedBy: [],
+      flaggedBy: [],
+      createdAt: new Date(),
+    });
+
+    // --- REWARD TRUST SCORE (Shah Ahafik Arman's Module) [cite: 63] ---
+    const updateResult = await usersCollection.updateOne(
+      { email: userEmail },
+      { $inc: { trustScore: 5 } },
+    );
+
+    if (updateResult.matchedCount === 0) {
+      await usersCollection.insertOne({
+        email: userEmail,
+        trustScore: 105, // Start with base 100 + 5 reward [cite: 24, 63]
+        name: complaintData.userName || "Citizen",
+        createdAt: new Date(),
+      });
+    }
+
+    res.status(201).send({
+      success: true,
+      insertedId: result.insertedId,
+      message: `Reported as ${finalCategory}! Initial Urgency: ${initialUrgencyScore}`,
+    });
+  } catch (error) {
+    console.error("Backend Error:", error);
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+// 4. Urgency Logic Feature (Module 2)
+app.post("/api/add-complaint-urgent", async (req, res) => {
+  try {
+    const complaint = req.body;
+    const keywordWeight =
+      (Array.isArray(complaint.keywords) ? complaint.keywords.length : 0) * 2;
+    const upvoteWeight = (complaint.upvotes || 0) * 1.5;
+
+    complaint.urgencyScore = keywordWeight + upvoteWeight;
+    complaint.createdAt = new Date();
+
+    const result = await complaintsCollection.insertOne(complaint);
+    res.status(201).send(result);
+  } catch (error) {
+    res.status(500).send({ error: "Failed to add complaint" });
+  }
+});
+
+// 5. Sorted Urgent Reports for Admin
+app.get("/api/urgent-reports", async (req, res) => {
+  try {
+    const results = await complaintsCollection
+      .find()
+      .sort({ urgencyScore: -1 })
+      .toArray();
+    res.send(results);
+  } catch (error) {
+    res.status(500).send({ error: "Failed to fetch reports" });
+  }
+});
+
+// 6. Get Single Complaint by ID (For Details Page)
+// Example single complaint route
+app.get("/api/complaints/:id", async (req, res) => {
+  try {
+    const prob = await complaintsCollection.findOne({
+      _id: new ObjectId(req.params.id),
+    });
+    if (!prob) return res.status(404).send({ message: "Not found" });
+
+    // Use the same function to get the consistent score
+    res.send({
+      ...prob,
+      urgencyScore: calculateUrgency(prob),
+    });
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// PATCH route to increase upvotes
+app.patch("/api/complaints/upvote/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userEmail } = req.body;
+
+    const complaint = await complaintsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+    if (!complaint)
+      return res.status(404).send({ success: false, message: "Not found" });
+
+    if (complaint.upvotedBy?.includes(userEmail)) {
+      return res
+        .status(400)
+        .send({ success: false, message: "Already upvoted!" });
+    }
+
+    const wasFlagged = complaint.flaggedBy?.includes(userEmail);
+    const flagDecrement = wasFlagged ? -1 : 0;
+
+    const newUpvoteCount = (complaint.upvotes || 0) + 1;
+    const newFlagCount = (complaint.flags || 0) + flagDecrement;
+
+    let newPriority = "Medium";
+    if (newUpvoteCount > 10) newPriority = "High";
+    if (newFlagCount > 5) newPriority = "Low";
+
+    await complaintsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $inc: { upvotes: 1, flags: flagDecrement },
+        $set: { priority: newPriority },
+        $addToSet: { upvotedBy: userEmail },
+        $pull: { flaggedBy: userEmail },
+      },
+    );
+
+    res.send({
+      success: true,
+      newPriority,
+      flags: newFlagCount,
+      upvotes: newUpvoteCount,
+    });
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+// PATCH route to restore trust score
+app.patch("/api/users/restore-score/:email", async (req, res) => {
+  const { email } = req.params;
+  const result = await usersCollection.updateOne(
+    { email: email },
+    { $set: { trustScore: 80 } },
+  );
+  res.send({ success: true, message: "Score restored!" });
+});
+
+// User-Specific Report Count & Upvotes
+app.get("/api/user-stats/:email", async (req, res) => {
+  try {
+    const { email } = req.params;
+
+    const reportCount = await complaintsCollection.countDocuments({
+      userEmail: email,
+    });
+
+    const upvoteData = await complaintsCollection
+      .aggregate([
+        { $match: { userEmail: email } },
+        { $group: { _id: null, totalUpvotes: { $sum: "$upvotes" } } },
+      ])
+      .toArray();
+
+    const totalUpvotes = upvoteData.length > 0 ? upvoteData[0].totalUpvotes : 0;
+
+    res.send({
+      reportCount,
+      totalUpvotes,
+    });
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// PATCH route to flag a complaint
+app.patch("/api/complaints/flag/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { userEmail } = req.body;
+
+    const complaint = await complaintsCollection.findOne({
+      _id: new ObjectId(id),
+    });
+    if (!complaint)
+      return res.status(404).send({ success: false, message: "Not found" });
+
+    if (complaint.flaggedBy?.includes(userEmail)) {
+      return res
+        .status(400)
+        .send({ success: false, message: "Already flagged!" });
+    }
+
+    const wasUpvoted = complaint.upvotedBy?.includes(userEmail);
+    const upvoteDecrement = wasUpvoted ? -1 : 0;
+
+    const newFlagCount = (complaint.flags || 0) + 1;
+    const newUpvoteCount = (complaint.upvotes || 0) + upvoteDecrement;
+
+    let newPriority = "Medium";
+    if (newFlagCount > 5) newPriority = "Low";
+    if (newUpvoteCount > 10) newPriority = "High";
+
+    await complaintsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      {
+        $inc: { flags: 1, upvotes: upvoteDecrement },
+        $set: { priority: newPriority },
+        $addToSet: { flaggedBy: userEmail },
+        $pull: { upvotedBy: userEmail },
+      },
+    );
+
+    res.send({
+      success: true,
+      newPriority,
+      flags: newFlagCount,
+      upvotes: newUpvoteCount,
+    });
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+// Payment Integration with SSLCommerz
+app.post("/payment", async (req, res) => {
+  const order = req.body;
+  const current_tran_id = new ObjectId().toString();
+
+  await ordersCollection.insertOne({
+    tran_id: current_tran_id,
+    userEmail: order.userEmail,
+    status: "pending",
+    amount: 500,
+    createdAt: new Date(),
+  });
+
+  const data = {
+    total_amount: 500,
+    currency: "BDT",
+    tran_id: current_tran_id,
+    success_url: `http://localhost:1069/payment/success/${current_tran_id}`,
+    fail_url: "http://localhost:1069/payment/fail",
+    cancel_url: "http://localhost:1069/payment/cancel",
+    ipn_url: "http://localhost:1069/ipn",
+    shipping_method: "No",
+    product_name: "Trust Score Fine",
+    product_category: "Service",
+    product_profile: "general",
+    cus_name: order.userName,
+    cus_email: order.userEmail,
+    cus_add1: "Dhaka",
+    cus_city: "Dhaka",
+    cus_country: "Bangladesh",
+    cus_phone: order.phoneNumber,
+  };
+  const sslcz = new SSLCommerzPayment(store_id, store_passwd, is_live);
+  sslcz.init(data).then((apiResponse) => {
+    let GatewayPageURL = apiResponse.GatewayPageURL;
+    res.send({ url: GatewayPageURL });
+    //console.log("Redirecting user to:", GatewayPageURL);
+  });
+});
+
+app.post("/payment/success/:tranId", async (req, res) => {
+  try {
+    const { tranId } = req.params;
+    const paymentData = req.body;
+
+    const orderRecord = await ordersCollection.findOne({ tran_id: tranId });
+
+    if (!orderRecord) {
+      console.error("❌ No matching order found for TranID:", tranId);
+      return res.redirect("http://localhost:5173/profile?status=error");
+    }
+
+    if (paymentData.status === "VALID") {
+      await usersCollection.updateOne(
+        { email: orderRecord.userEmail },
+        { $set: { trustScore: 80 } },
+      );
+      await ordersCollection.updateOne(
+        { tran_id: tranId },
+        { $set: { status: "success", paymentTime: new Date() } },
+      );
+
+      //console.log(`✅ Score restored for ${orderRecord.userEmail}`);
+      res.redirect(`http://localhost:5173/profile?status=success`);
+    }
+  } catch (error) {
+    console.error("🔥 Error:", error);
+    res.redirect("http://localhost:5173/profile?status=error");
+  }
+});
+
+app.post("/payment/fail", async (req, res) => {
+  const paymentData = req.body;
+  //console.log("❌ Payment Failed. Reason:", paymentData.error);
+
+  if (paymentData.tran_id) {
+    await ordersCollection.updateOne(
+      { tran_id: paymentData.tran_id },
+      { $set: { status: "failed", error: paymentData.error } },
+    );
+  }
+  res.redirect("http://localhost:5173/profile?status=failed");
+});
+
+app.post("/payment/cancel", async (req, res) => {
+  //console.log("⚠️ Payment Cancelled by user");
+  res.redirect("http://localhost:5173/profile?status=cancelled");
+});
+
+const CATEGORY_WEIGHTS = {
+  "Fire Hazard": 40,
+  Electrical: 35,
+  "Water Leak": 25,
+  Environment: 15,
+  "Broken Bench": 5,
+  General: 10,
+};
+
+
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
