@@ -869,3 +869,632 @@ app.patch("/api/complaints/status/:id", async (req, res) => {
     res.status(500).send({ success: false, message: error.message });
   }
 });
+
+// --- WORKER COLLECTION & API ---
+
+// POST: Register a new worker application
+app.post("/api/workers/apply", async (req, res) => {
+  try {
+    const workerData = req.body;
+    const { email, region, specialization } = workerData;
+
+    // Check if worker already exists
+    const existingWorker = await workersCollection.findOne({ email });
+    if (existingWorker) {
+      return res.status(400).send({
+        success: false,
+        message: "An application with this email already exists.",
+      });
+    }
+
+    const newWorker = {
+      ...workerData,
+      status: "Pending", // Admin must approve
+      activeJobs: 0, // Initial load is zero
+      assignedTaskIds: [], // Empty task list
+      appliedAt: new Date(),
+    };
+
+    const result = await workersCollection.insertOne(newWorker);
+    res.status(201).send({
+      success: true,
+      insertedId: result.insertedId,
+      message: "Application submitted! Wait for Admin approval.",
+    });
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+// GET: Fetch all verified workers for assignment
+app.get("/api/workers/verified", async (req, res) => {
+  try {
+    const workers = await workersCollection
+      .find({ status: "Verified" })
+      .toArray();
+    res.send(workers);
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// Change this in your backend index.js
+app.get("/api/workers", async (req, res) => {
+  try {
+    // This fetches EVERYONE regardless of status
+    const workers = await workersCollection
+      .aggregate([
+        {
+          $lookup: {
+            from: "complaints",
+            localField: "assignedTaskIds",
+            foreignField: "_id",
+            as: "currentTasks",
+          },
+        },
+      ])
+      .toArray();
+    res.send(workers);
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// PATCH: Assign a complaint to a worker
+app.patch("/api/workers/assign", async (req, res) => {
+  try {
+    const { taskId, workerEmail, workerRegion } = req.body;
+
+    const task = await complaintsCollection.findOne({
+      _id: new ObjectId(taskId),
+    });
+
+    // --- UPDATED VALIDATION LOGIC ---
+    // If task.region exists, then we check for a match.
+    // If task.region is missing (undefined/null), we skip the mismatch error.
+    if (task.region && workerRegion) {
+      // Use fuzzy matching (.includes) to handle "Dhaka" vs "Dhaka Division"
+      const isMatch =
+        task.region.includes(workerRegion) ||
+        workerRegion.includes(task.region);
+
+      if (!isMatch) {
+        return res.status(400).send({
+          success: false,
+          message: `Region Mismatch! Task is in ${task.region}, but worker is in ${workerRegion}.`,
+        });
+      }
+    }
+
+    // 3. Update Complaint Status
+    await complaintsCollection.updateOne(
+      { _id: new ObjectId(taskId) },
+      {
+        $set: {
+          status: "In Review",
+          assignedWorkerEmail: workerEmail,
+        },
+        $push: {
+          timeline: {
+            status: "In Review",
+            message: `Worker ${workerEmail} assigned to this task.`,
+            time: new Date(),
+          },
+        },
+      },
+    );
+
+    // 4. Update Worker Stats
+    await workersCollection.updateOne(
+      { email: workerEmail },
+      {
+        $inc: { activeJobs: 1 },
+        $push: { assignedTaskIds: new ObjectId(taskId) },
+      },
+    );
+
+    res.send({ success: true, message: "Task assigned successfully!" });
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+// PATCH: Admin approves a worker application
+app.patch("/api/workers/verify/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const filter = { _id: new ObjectId(id) };
+    const updateDoc = {
+      $set: { status: "Verified" },
+    };
+
+    const result = await workersCollection.updateOne(filter, updateDoc);
+
+    if (result.modifiedCount > 0) {
+      res.send({ success: true, message: "Worker verified successfully!" });
+    } else {
+      res.status(404).send({
+        success: false,
+        message: "Worker not found or already verified.",
+      });
+    }
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+// GET: Check if a specific email belongs to a verified worker
+app.get("/api/workers/check/:email", async (req, res) => {
+  try {
+    const email = req.params.email;
+    const worker = await workersCollection.findOne({
+      email: email,
+      status: "Verified",
+    });
+
+    if (worker) {
+      res.send({ isWorker: true });
+    } else {
+      res.send({ isWorker: false });
+    }
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// GET: Find which worker is assigned to a specific task
+app.get("/api/workers/assigned-to/:taskId", async (req, res) => {
+  try {
+    const taskId = req.params.taskId;
+    const worker = await workersCollection.findOne({
+      assignedTaskIds: new ObjectId(taskId),
+    });
+
+    if (worker) {
+      res.send({
+        found: true,
+        name: worker.name,
+        email: worker.email,
+        phone: worker.phone,
+      });
+    } else {
+      res.send({ found: false });
+    }
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+app.patch("/api/complaints/resolve/:id", async (req, res) => {
+  try {
+    const taskId = req.params.id;
+    const { workerEmail } = req.body;
+
+    // 1. Check if the task is already resolved
+    const task = await complaintsCollection.findOne({
+      _id: new ObjectId(taskId),
+    });
+    if (task.status === "Resolved") {
+      return res
+        .status(400)
+        .send({ success: false, message: "Task is already resolved." });
+    }
+
+    // 2. Update the Complaint
+    await complaintsCollection.updateOne(
+      { _id: new ObjectId(taskId) },
+      {
+        $set: { status: "Resolved" },
+        $push: {
+          timeline: {
+            status: "Resolved",
+            time: new Date(),
+            message: "Work officially completed.",
+          },
+        },
+      },
+    );
+
+    // 3. Update the Worker ONLY IF they are currently assigned to this task
+    // Using $pull and $inc together ensures we only decrement if the ID was actually there
+    const workerUpdate = await workersCollection.updateOne(
+      {
+        email: workerEmail,
+        assignedTaskIds: new ObjectId(taskId), // This is the "Gatekeeper" condition
+      },
+      {
+        $inc: { activeJobs: -1 },
+        $pull: { assignedTaskIds: new ObjectId(taskId) },
+      },
+    );
+
+    res.send({ success: true, message: "Task resolved and worker freed." });
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+app.get("/api/admin/generate-report", async (req, res) => {
+  let browser = null;
+  try {
+    // A. CONNECT TO DATABASE (Ensure collections are available)
+    // Assuming you use your getDB or connectDB helper here
+    await client.connect();
+    const db = client.db("civicEyeDB");
+    const complaintsCollection = db.collection("complaints");
+
+    // B. HELPER FUNCTION
+    const formatDuration = (hours) => {
+      if (!hours || hours <= 0) return "0 Mins";
+      if (hours < 1) return `${(hours * 60).toFixed(0)} Mins`;
+      if (hours > 24) return `${(hours / 24).toFixed(1)} Days`;
+      return `${hours.toFixed(1)} Hours`;
+    };
+
+    // C. DATA CALCULATIONS (Same as your code)
+    const allComplaints = await complaintsCollection.find({}).toArray();
+    const resolvedComplaints = allComplaints.filter(
+      (c) => c.status === "Resolved" && c.timeline,
+    );
+    const totalComplaints = allComplaints.length;
+    const topIssues = [...allComplaints]
+      .sort((a, b) => (b.upvotes || 0) - (a.upvotes || 0))
+      .slice(0, 3);
+
+    const resolutionStats = resolvedComplaints
+      .map((c) => {
+        const start = new Date(c.createdAt);
+        const endEvent = c.timeline?.find((t) => t.status === "Resolved");
+        const end = endEvent ? new Date(endEvent.time) : new Date();
+        const diffInMs = end - start;
+        const durationHours = diffInMs / (1000 * 60 * 60);
+        return {
+          category: c.category || "General",
+          duration: durationHours > 0 ? durationHours : 0.01,
+        };
+      })
+      .sort((a, b) => a.duration - b.duration);
+
+    const fastest = resolutionStats[0] || { category: "N/A", duration: 0 };
+    const slowest = resolutionStats[resolutionStats.length - 1] || {
+      category: "N/A",
+      duration: 0,
+    };
+
+    // D. HTML TEMPLATE (Your template)
+    const htmlContent = `<html>
+
+        <head>
+
+          <style>
+
+            body { font-family: 'Helvetica', sans-serif; padding: 40px; color: #333; }
+
+            .header { text-align: center; border-bottom: 4px solid #3b82f6; padding-bottom: 20px; }
+
+            .stat-card { background: #f3f4f6; padding: 20px; border-radius: 15px; margin: 20px 0; }
+
+            .grid { display: flex; justify-content: space-between; gap: 20px; }
+
+            table { width: 100%; border-collapse: collapse; margin-top: 20px; }
+
+            th, td { text-align: left; padding: 12px; border-bottom: 1px solid #ddd; }
+
+            th { background-color: #3b82f6; color: white; }
+
+            .highlight { color: #3b82f6; font-weight: bold; }
+
+          </style>
+
+        </head>
+
+        <body>
+
+          <div class="header">
+
+            <h1>CivicEye: Monthly Society Report</h1>
+
+            <p>Generated on: ${new Date().toLocaleDateString()}</p>
+
+          </div>
+
+
+
+          <div class="stat-card">
+
+            <h2>Summary</h2>
+
+            <p>Total Complaints Logged: <span class="highlight">${totalComplaints}</span></p>
+
+          </div>
+
+
+
+          <h3>Top 3 High-Priority Issues (By Upvotes)</h3>
+
+          <table>
+
+            <tr><th>Issue Category</th><th>Upvotes</th><th>Location</th></tr>
+
+            ${topIssues
+
+              .map(
+                (t) => `
+
+              <tr>
+
+                <td>${(t.category || "General").toUpperCase()}</td>
+
+                <td>${t.upvotes || 0}</td>
+
+                <td>${t.region || t.address || "N/A"}</td>
+
+              </tr>`,
+              )
+
+              .join("")}
+
+          </table>
+
+
+
+          <h3>Efficiency Metrics</h3>
+
+          <div class="grid">
+
+            <div class="stat-card" style="flex: 1; border-left: 5px solid #22c55e;">
+
+              <p><b>Fastest Resolution</b></p>
+
+              <p><span class="highlight">${(fastest.category || "N/A").toUpperCase()}</span></p>
+
+              <p>${formatDuration(fastest.duration)}</p>
+
+            </div>
+
+            <div class="stat-card" style="flex: 1; border-left: 5px solid #ef4444;">
+
+              <p><b>Slowest Resolution</b></p>
+
+              <p><span class="highlight">${(slowest.category || "N/A").toUpperCase()}</span></p>
+
+              <p>${formatDuration(slowest.duration)}</p>
+
+            </div>
+
+          </div>
+
+        </body>
+
+      </html>`;
+
+    // E. VERCEL-COMPATIBLE BROWSER LAUNCH
+    const isProd = process.env.NODE_ENV === "production";
+
+    browser = await puppeteer.launch({
+      args: isProd
+        ? chromium.args
+        : ["--no-sandbox", "--disable-setuid-sandbox"],
+      // Note: Replace the URL below with the latest version if needed
+      executablePath: isProd
+        ? await chromium.executablePath(
+            "https://github.com/Sparticuz/chromium/releases/download/v123.0.1/chromium-v123.0.1-pack.tar",
+          )
+        : "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe", // Path for your Windows PC
+      headless: isProd ? chromium.headless : true,
+    });
+
+    const page = await browser.newPage();
+    await page.setContent(htmlContent, { waitUntil: "networkidle0" });
+    const pdfBuffer = await page.pdf({ format: "A4", printBackground: true });
+
+    await browser.close();
+
+    res.contentType("application/pdf");
+    res.setHeader("Content-Disposition", "inline; filename=Monthly_Report.pdf");
+    res.send(pdfBuffer);
+  } catch (error) {
+    console.error("PDF Error:", error);
+    if (browser) await browser.close();
+    res.status(500).send({ error: error.message });
+  }
+});
+
+app.get("/api/leaderboard", async (req, res) => {
+  try {
+    const leaderboard = await complaintsCollection
+      .aggregate([
+        {
+          $group: {
+            _id: "$userEmail", // Group by user
+            userName: { $first: "$userName" },
+            totalReports: { $sum: 1 },
+            totalUpvotes: { $sum: "$upvotes" },
+            validReports: {
+              $sum: { $cond: [{ $ne: ["$status", "Rejected"] }, 1, 0] },
+            },
+          },
+        },
+        { $sort: { totalUpvotes: -1 } }, // Rank by upvotes or reports
+        { $limit: 10 },
+      ])
+      .toArray();
+
+    // Map the badges based on the logic
+    const results = leaderboard.map((user) => ({
+      ...user,
+      badges: [
+        user.totalReports >= 10 ? "Eagle Eye" : null,
+        user.totalUpvotes >= 50 ? "Community Guardian" : null,
+        user.totalReports >= 5 ? "Active Citizen" : null,
+        user.totalUpvotes / user.totalReports > 10 ? "Impact Maker" : null,
+      ].filter(Boolean),
+    }));
+
+    res.send(results);
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+app.get("/api/admin/community-stats", async (req, res) => {
+  try {
+    const allComplaints = await complaintsCollection.find({}).toArray();
+
+    // 1. Calculate Health Score (Resolved vs Total)
+    const total = allComplaints.length;
+    const resolved = allComplaints.filter(
+      (c) => c.status === "Resolved",
+    ).length;
+    const healthScore = total > 0 ? Math.round((resolved / total) * 100) : 0;
+
+    // 2. Group by Category for Doughnut Chart
+    const categoryData = await complaintsCollection
+      .aggregate([
+        {
+          // 1. Normalize the category to lowercase for grouping
+          $project: {
+            normalizedCategory: { $toLower: "$category" },
+          },
+        },
+        {
+          // 2. Group by the normalized field
+          $group: {
+            _id: "$normalizedCategory",
+            value: { $sum: 1 },
+          },
+        },
+        {
+          // 3. Rename _id to name for Recharts and capitalize for the UI
+          $project: {
+            name: { $toUpper: "$_id" }, // Optional: Makes labels look better (GENERAL)
+            value: 1,
+            _id: 0,
+          },
+        },
+      ])
+      .toArray();
+
+    // Inside your /api/admin/community-stats route
+    let statusLabel = "Optimal";
+    let statusColor = "text-success"; // Green
+
+    if (healthScore < 50) {
+      statusLabel = "Critical";
+      statusColor = "text-error"; // Red
+    } else if (healthScore < 80) {
+      statusLabel = "Stable";
+      statusColor = "text-warning"; // Yellow
+    }
+
+    res.send({
+      healthScore,
+      categoryData,
+      total,
+      resolved,
+      statusLabel,
+      statusColor,
+    });
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// Posts
+
+const checkToxicity = async (text) => {
+  try {
+    // encodeURIComponent ensures spaces and symbols don't break the URL
+    const response = await fetch(
+      `https://www.purgomalum.com/service/containsprofanity?text=${encodeURIComponent(text)}`,
+    );
+
+    // PurgoMalum returns the literal text "true" or "false"
+    const result = await response.text();
+
+    console.log(`Content Safety Check: ${text} -> Profane: ${result}`);
+
+    return result === "true";
+  } catch (error) {
+    console.error("PurgoMalum API Error:", error);
+    return false;
+  }
+};
+
+app.post("/api/community/posts", async (req, res) => {
+  try {
+    const { content, userName, userEmail } = req.body;
+
+    if (!content) return res.status(400).send({ message: "Content is empty" });
+
+    // AI/Filter Check
+    const isToxic = await checkToxicity(content);
+
+    const newPost = {
+      content,
+      userName,
+      userEmail,
+      isToxic,
+      status: isToxic ? "Blocked" : "Published",
+      createdAt: new Date(),
+    };
+
+    // Save to DB regardless (so Admin can see violations)
+    await postsCollection.insertOne(newPost);
+
+    if (isToxic) {
+      return res.status(400).send({
+        success: false,
+        message: "Post blocked! Please maintain a respectful community tone.",
+      });
+    }
+
+    res.send({ success: true, message: "Post shared successfully!" });
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+// 3. Get Public Posts
+app.get("/api/community/posts", async (req, res) => {
+  // Only show posts that are NOT toxic
+  const posts = await postsCollection
+    .find({ isToxic: false })
+    .sort({ createdAt: -1 })
+    .toArray();
+  res.send(posts);
+});
+
+app.patch("/api/community/posts/like/:id", async (req, res) => {
+  const { id } = req.params;
+  const { userEmail } = req.body;
+
+  try {
+    const post = await postsCollection.findOne({ _id: new ObjectId(id) });
+
+    // Check if user already liked the post
+    const hasLiked = post.likes?.includes(userEmail);
+
+    let updateDoc;
+    if (hasLiked) {
+      // If already liked, remove (unlike)
+      updateDoc = { $pull: { likes: userEmail } };
+    } else {
+      // If not liked, add to array
+      updateDoc = { $addToSet: { likes: userEmail } };
+    }
+
+    const result = await postsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      updateDoc,
+    );
+
+    res.send({ success: true, isLiked: !hasLiked });
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+app.listen(port, () => {
+  console.log(`Server is running on port ${port}`);
+});
