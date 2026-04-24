@@ -591,7 +591,159 @@ const CATEGORY_WEIGHTS = {
   General: 10,
 };
 
-
 app.listen(port, () => {
   console.log(`Server is running on port ${port}`);
+});
+app.get("/api/complaints", async (req, res) => {
+  try {
+    await connectDB();
+    const complaints = await complaintsCollection.find().toArray();
+    const complaintsWithUrgency = complaints.map((prob) => ({
+      ...prob,
+      urgencyScore: calculateUrgency(prob),
+    }));
+    res.send(complaintsWithUrgency);
+  } catch (error) {
+    res.status(500).send({ error: error.message });
+  }
+});
+
+const ADMIN_EMAILS = [
+  "ak01739394811@gmail.com",
+  "sumaiyatasnimkhan24@gmail.com",
+];
+
+app.patch("/api/complaints/update-images/:id", async (req, res) => {
+  try {
+    const id = req.params.id;
+    const updates = req.body; // { beforeImage: "url" } or { afterImage: "url" }
+
+    const result = await complaintsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: updates },
+    );
+
+    if (result.modifiedCount > 0) {
+      res.send({ success: true, message: "Image updated in DB" });
+    } else {
+      res
+        .status(400)
+        .send({ success: false, message: "No changes made to DB" });
+    }
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+// --- WORKER IMAGE UPLOAD ROUTE ---
+app.patch("/api/complaints/update-status/:id", async (req, res) => {
+  await connectDB();
+  const taskId = req.params.id;
+  const { newStatus, workerEmail, message } = req.body;
+
+  // 1. Move the status and add to timeline
+  const statusUpdate = await complaintsCollection.updateOne(
+    { _id: new ObjectId(taskId) },
+    {
+      $set: { status: newStatus },
+      $push: {
+        timeline: { status: newStatus, time: new Date(), message: message },
+      },
+    },
+  );
+
+  // 2. If the task is finished, free the worker
+  if (newStatus === "Resolved" && workerEmail) {
+    await workersCollection.updateOne(
+      { email: workerEmail, assignedTaskIds: new ObjectId(taskId) },
+      {
+        $inc: { activeJobs: -1 },
+        $pull: { assignedTaskIds: new ObjectId(taskId) },
+      },
+    );
+  }
+
+  res.send({ success: true });
+});
+
+// 1. UPDATE STATUS (Admin Only) - Legacy route (Keep if used elsewhere, but ideally use /status/:id below)
+app.patch("/api/complaints/:id", async (req, res) => {
+  await connectDB();
+  const { id } = req.params;
+  const { status, adminEmail } = req.body;
+
+  if (!ADMIN_EMAILS.includes(adminEmail)) {
+    return res
+      .status(403)
+      .send({ message: "Unauthorized: Admin access required" });
+  }
+
+  const filter = { _id: new ObjectId(id) };
+  const updateDoc = { $set: { status: status } };
+  const result = await complaintsCollection.updateOne(filter, updateDoc);
+  res.send(result);
+});
+
+// 2. DELETE COMPLAINT (Admin Only)
+app.delete("/api/complaints/:id", async (req, res) => {
+  await connectDB();
+  const { id } = req.params;
+  const adminEmail = req.query.email;
+
+  if (!ADMIN_EMAILS.includes(adminEmail)) {
+    return res.status(403).send({ message: "Unauthorized" });
+  }
+
+  const result = await complaintsCollection.deleteOne({
+    _id: new ObjectId(id),
+  });
+  res.send(result);
+});
+
+// --- 3. ADMIN MANUAL UPVOTE OVERRIDE ---
+app.patch("/api/complaints/admin-upvote/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newCount, adminEmail } = req.body;
+
+    if (!ADMIN_EMAILS.includes(adminEmail)) {
+      return res.status(403).send({ message: "Unauthorized" });
+    }
+
+    const count = parseInt(newCount);
+    let newPriority = count > 10 ? "High" : "Medium";
+
+    const result = await complaintsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { upvotes: count, priority: newPriority } },
+    );
+
+    res.send({ success: true, newPriority, result });
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
+});
+
+// --- 2. ADMIN MANUAL FLAG OVERRIDE ---
+app.patch("/api/complaints/admin-flag/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { newCount, adminEmail } = req.body;
+
+    if (!ADMIN_EMAILS.includes(adminEmail)) {
+      return res.status(403).send({ message: "Unauthorized" });
+    }
+
+    const count = parseInt(newCount);
+    let newPriority = count > 5 ? "Low" : "Medium";
+
+    const result = await complaintsCollection.updateOne(
+      { _id: new ObjectId(id) },
+      { $set: { flags: count, priority: newPriority } },
+    );
+
+    res.send({ success: true, newPriority, result });
+  } catch (error) {
+    res.status(500).send({ success: false, error: error.message });
+  }
 });
